@@ -11,7 +11,6 @@
 
 #include <string.h>
 
-#define DIMMER_METATABLE "dimmer.mt"
 #define TAG "DIMMER"
 
 typedef struct {
@@ -24,6 +23,11 @@ typedef struct {
 #define MAINS_FREQUENCY 50   // Hz
 #define TIMER_DIVIDER (TIMER_BASE_CLK / 1000 / 1000 * TIMER_RESOLUTION)
 #define TICKS_PER_CYCLE (1000 * 1000 / (MAINS_FREQUENCY * 2) / TIMER_RESOLUTION)
+
+#define DIM_TIMER0 0x0
+#define DIM_TIMER1 0x1
+#define DIM_TIMER2 0x2
+#define DIM_TIMER3 0x3
 
 static intr_handle_t s_timer_handle;
 static int timerGroup = -1;
@@ -176,17 +180,22 @@ static int dimmer_set_level(lua_State* L) {
 
 // hw timer group, hw_timer num, zc pin
 static int dimmer_setup(lua_State* L) {
-    disable_interrupts(L);
-    timerGroup = luaL_checkint(L, 1);
-    timerNum = luaL_checkint(L, 2);
-    zcPin = luaL_checkint(L, 3);
-    ESP_LOGD(TAG, "Dimmer setup. TG=%d, TN=%d, ZC=%d", timerGroup, timerNum, zcPin);
+    luaL_checkanytable(L, 1);
+    lua_getfield(L, 1, "syncGpio");
+    zcPin = luaL_checkinteger(L, -1);
+    lua_getfield(L, 1, "timer");
+    int timer = luaL_optint(L, -1, DIM_TIMER0);
+    timerGroup = timer & 0x1;
+    timerNum = (timer & 0x10) >> 1;
 
     if (timerGroup == 0) {
         timerGroupDev = &TIMERG0;
     } else {
         timerGroupDev = &TIMERG1;
     }
+    ESP_LOGD(TAG, "Dimmer setup. TG=%d, TN=%d, ZC=%d", timerGroup, timerNum, zcPin);
+
+    disable_interrupts(L);
 
     timer_config_t config = {
         .alarm_en = true,
@@ -203,8 +212,6 @@ static int dimmer_setup(lua_State* L) {
 
     timer_set_alarm_value(timerGroup, timerNum, 1);
     printf("timer_set_alarm_value\n");
-    //  timer_enable_intr(timerGroup, timerNum);
-    //    printf("timer_enable_intr\n");
     timer_isr_register(timerGroup, timerNum, &timer_isr, NULL, 0, &s_timer_handle);
     printf("timer_isr_register\n");
 
@@ -213,7 +220,6 @@ static int dimmer_setup(lua_State* L) {
 
     check_err(L, gpio_set_direction(zcPin, GPIO_MODE_INPUT));
     check_err(L, gpio_set_pull_mode(zcPin, GPIO_PULLUP_ONLY));
-    //    check_err(L, gpio_intr_disable(zcPin));
     check_err(L, gpio_set_intr_type(zcPin, GPIO_INTR_POSEDGE));
     check_err(L, gpio_isr_handler_add(zcPin, zc_isr, NULL));
 
@@ -222,21 +228,6 @@ static int dimmer_setup(lua_State* L) {
     return 0;
 }
 
-// map client methods to functions:
-LROT_BEGIN(dimmer_metatable)
-/*
-        {LSTRKEY("connect"), LFUNCVAL(mqtt_connect)},
-        {LSTRKEY("close"), LFUNCVAL(mqtt_close)},
-        {LSTRKEY("lwt"), LFUNCVAL(mqtt_lwt)},
-        {LSTRKEY("publish"), LFUNCVAL(mqtt_publish)},
-        {LSTRKEY("subscribe"), LFUNCVAL(mqtt_subscribe)},
-        {LSTRKEY("unsubscribe"), LFUNCVAL(mqtt_unsubscribe)},
-        {LSTRKEY("on"), LFUNCVAL(mqtt_on)},
-        {LSTRKEY("__gc"), LFUNCVAL(mqtt_delete)},
-        {LSTRKEY("__index"), LROVAL(mqtt_metatable_map)},
-        */
-LROT_END(dimmer_metatable, NULL, 0)
-
 // Module function map
 LROT_BEGIN(dimmer)
 LROT_FUNCENTRY(setup, dimmer_setup)
@@ -244,10 +235,15 @@ LROT_FUNCENTRY(add, dimmer_add)
 LROT_FUNCENTRY(remove, dimmer_remove)
 LROT_FUNCENTRY(setLevel, dimmer_set_level)
 LROT_FUNCENTRY(list, dimmer_list_debug)
+LROT_NUMENTRY(TIMER_0, DIM_TIMER0)
+LROT_NUMENTRY(TIMER_1, DIM_TIMER1)
+LROT_NUMENTRY(TIMER_2, DIM_TIMER2)
+LROT_NUMENTRY(TIMER_3, DIM_TIMER3)
+
 LROT_END(dimmer, NULL, 0)
 
 int luaopen_dimmer(lua_State* L) {
-    luaL_rometatable(L, DIMMER_METATABLE, (void*)dimmer_metatable_map);  // create metatable for dimmer
+    //luaL_rometatable(L, DIMMER_METATABLE, (void*)dimmer_metatable_map);  // create metatable for dimmer
     return 0;
 }
 
