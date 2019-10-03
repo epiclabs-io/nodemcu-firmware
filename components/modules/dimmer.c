@@ -17,9 +17,10 @@ typedef struct {
     int pin;
     uint8_t mode;
     int level;
+    bool on;
 } dim_t;
 
-#define TIMER_RESOLUTION 10  // us;
+#define TIMER_RESOLUTION 20  // us;
 #define MAINS_FREQUENCY 50   // Hz
 #define TIMER_DIVIDER (TIMER_BASE_CLK / 1000 / 1000 * TIMER_RESOLUTION)
 #define TICKS_PER_CYCLE (1000 * 1000 / (MAINS_FREQUENCY * 2) / TIMER_RESOLUTION)
@@ -33,8 +34,8 @@ static intr_handle_t s_timer_handle;
 static int timerGroup = -1;
 static int timerNum = -1;
 static int zcPin = -1;
-static int t = 0;
-static int p = TICKS_PER_CYCLE;
+static int64_t zcTimestamp = 0;
+static int64_t p = 1000 * 1000 / MAINS_FREQUENCY / 2;
 static bool reset = false;
 static dim_t* dims = NULL;
 static int dimCount = 0;
@@ -54,24 +55,25 @@ static int check_err(lua_State* L, esp_err_t err) {
 }
 
 static void timer_isr(void* arg) {
+    int64_t now = esp_timer_get_time();
+    int64_t elapsed = now - zcTimestamp;
     if (reset) {
         reset = false;
         for (int i = 0; i < dimCount; i++) {
             if (dims[i].level == 0) {
                 gpio_set_level(dims[i].pin, 1);
+                dims[i].on = true;
             } else {
                 gpio_set_level(dims[i].pin, 0);
+                dims[i].on = false;
             }
         }
-        p = t;
-        t = 0;
     } else {
-        t++;
-
         for (int i = 0; i < dimCount; i++) {
             int level = dims[i].level;
-            if (t == level && level > 0) {
+            if (elapsed > level && dims[i].on == false) {
                 gpio_set_level(dims[i].pin, 1);
+                dims[i].on = true;
             }
         }
     }
@@ -81,12 +83,13 @@ static void timer_isr(void* arg) {
 static int zCount = 0;
 static void zc_isr(void* arg) {
     zCount++;
-
-    if (t > TICKS_PER_CYCLE / 2) {  // debounce the zc pin
+    int64_t now = esp_timer_get_time();
+    int64_t elapsed = now - zcTimestamp;
+    if (elapsed > 5000) {  // 1000 * 1000 / MAINS_FREQUENCY / 4) {  // debounce the zc pin
+        zcTimestamp = now;
+        p = elapsed;
         reset = true;
     }
-
-    //gpio_intr_enable(zcPin);
 }
 
 static void enable_interrupts(lua_State* L) {
@@ -119,6 +122,7 @@ static int dimmer_add(lua_State* L) {
     dims[dimCount].pin = pin;
     dims[dimCount].level = 0;
     dims[dimCount].mode = 0;
+    dims[dimCount].on = false;
     dimCount++;
     gpio_set_level(pin, 0);
     enable_interrupts(L);
@@ -146,7 +150,7 @@ static int dimmer_remove(lua_State* L) {
 
 static int dimmer_list_debug(lua_State* L) {
     disable_interrupts(L);
-    ESP_LOGD(TAG, "p=%d, zcount=%d, t=%d", p, zCount, t);
+    ESP_LOGD(TAG, "p=%lld, zcount=%d, zcTimestamp=%lld", p, zCount, zcTimestamp);
     for (int i = 0; i < dimCount; i++) {
         ESP_LOGD(TAG, "pin=%d, mode=%d, level=%d", dims[i].pin, dims[i].mode, dims[i].level);
     }
@@ -167,9 +171,6 @@ static int dimmer_set_level(lua_State* L) {
         if (dims[i].pin == pin) {
             int newLevel = (int)(((double)level) / 1000.0 * ((double)p));
             dims[i].level = newLevel;
-            if (newLevel <= t) {  // if the new level has been set at a time in which the pin should've been turned on already, turn it on.
-                gpio_set_level(dims[i].pin, 1);
-            }
             return 0;
         }
     }
