@@ -4,29 +4,28 @@
 ** See Copyright Notice in lua.h
 */
 
-
 #define linit_c
 #define LUA_LIB
 #define LUAC_CROSS_FILE
 
 #include "lua.h"
 
-#include "lualib.h"
-#include "lauxlib.h"
-#include "luaconf.h"
-#include "module.h"
-#include "lstate.h"
 #include <assert.h>
 #include <stdalign.h>
+#include "lauxlib.h"
+#include "lstate.h"
+#include "luaconf.h"
+#include "lualib.h"
+#include "module.h"
 
 LROT_EXTERN(strlib);
 LROT_EXTERN(tab_funcs);
 LROT_EXTERN(dblib);
 LROT_EXTERN(co_funcs);
 LROT_EXTERN(math);
+LROT_EXTERN(iolib);
 #if defined(LUA_CROSS_COMPILER)
 LROT_EXTERN(oslib);
-//LROT_EXTERN(iolib);
 #endif
 /*
  * The NodeMCU Lua initalisation has been adapted to use linker-based module
@@ -63,63 +62,62 @@ const LOCK_IN_SECTION(zzzzzzzz) char _ro_end[1] = {0};
 #endif
 
 LROT_PUBLIC_BEGIN(LOCK_IN_SECTION(rotable) lua_rotables)
-  LROT_TABENTRY( string, strlib )
-  LROT_TABENTRY( table, tab_funcs )
-  LROT_TABENTRY( debug, dblib)
-  LROT_TABENTRY( coroutine, co_funcs )
-  LROT_TABENTRY( math, math )
-  LROT_TABENTRY( ROM, lua_rotables )
+LROT_TABENTRY(string, strlib)
+LROT_TABENTRY(table, tab_funcs)
+LROT_TABENTRY(debug, dblib)
+LROT_TABENTRY(coroutine, co_funcs)
+LROT_TABENTRY(math, math)
+LROT_TABENTRY(ROM, lua_rotables)
+LROT_TABENTRY(io, iolib)
 #ifdef LUA_CROSS_COMPILER
-  LROT_TABENTRY( os, oslib )
-  //LROT_TABENTRY( io, iolib )
+LROT_TABENTRY(os, oslib)
 LROT_END(lua_rotables, NULL, 0)
 #else
 LROT_BREAK(lua_rotables)
 #endif
 
 LROT_PUBLIC_BEGIN(LOCK_IN_SECTION(libs) lua_libs)
-  LROT_FUNCENTRY( _, luaopen_base )
-  LROT_FUNCENTRY( package, luaopen_package )
-  LROT_FUNCENTRY( string, luaopen_string )
-  LROT_FUNCENTRY( table, luaopen_table )
-  LROT_FUNCENTRY( debug, luaopen_debug )
+LROT_FUNCENTRY(_, luaopen_base)
+LROT_FUNCENTRY(package, luaopen_package)
+LROT_FUNCENTRY(string, luaopen_string)
+LROT_FUNCENTRY(table, luaopen_table)
+LROT_FUNCENTRY(debug, luaopen_debug)
+LROT_FUNCENTRY(io, luaopen_io)
 #ifndef LUA_CROSS_COMPILER
 LROT_BREAK(lua_rotables)
 #else
-  LROT_FUNCENTRY( io, luaopen_io )
-LROT_END( lua_libs, NULL, 0)
+LROT_END(lua_libs, NULL, 0)
 #endif
 
 #ifndef LUA_CROSS_COMPILER
 extern void luaL_dbgbreak(void);
 #endif
 
-void luaL_openlibs (lua_State *L) {
-
-  lua_pushrotable(L, LROT_TABLEREF(lua_libs));
-  lua_pushnil(L);  /* first key */
-  /* loop round and open libraries */
+void luaL_openlibs(lua_State *L) {
+    lua_pushrotable(L, LROT_TABLEREF(lua_libs));
+    lua_pushnil(L); /* first key */
+                    /* loop round and open libraries */
 #ifndef LUA_CROSS_COMPILER
 // luaL_dbgbreak();  // This is a test point for debugging library start ups
 #endif
-  while (lua_next(L, -2) != 0) {
-    if (lua_islightfunction(L,-1) &&
-        fvalue(L->top-1)) { // only process function entries
-      lua_pushvalue(L, -2);
-      lua_call(L, 1, 0);  // call luaopen_XXX(libname)
-    } else {
-      lua_pop(L, 1);
+    while (lua_next(L, -2) != 0) {
+        if (lua_islightfunction(L, -1) &&
+            fvalue(L->top - 1)) {  // only process function entries
+            lua_pushvalue(L, -2);
+            lua_call(L, 1, 0);  // call luaopen_XXX(libname)
+        } else {
+            lua_pop(L, 1);
+        }
     }
-  }
-  lua_pop(L, 1);  //cleanup stack
+    lua_pop(L, 1);  //cleanup stack
 }
 
 #ifndef LUA_CROSS_COMPILER
-# ifdef LUA_NUMBER_INTEGRAL
-#  define COMPARE <=
-# else
-#  define COMPARE ==
-# endif
+#ifdef LUA_NUMBER_INTEGRAL
+#define COMPARE <=
+#else
+#define COMPARE ==
+#endif
 _Static_assert(_Alignof(luaR_entry) COMPARE 8, "Unexpected alignment of module registration - update the linker script snippets to match!");
 _Static_assert(sizeof(luaR_entry) COMPARE 24, "Unexpect size of array member - update the linker script snippets to match!");
 #endif
