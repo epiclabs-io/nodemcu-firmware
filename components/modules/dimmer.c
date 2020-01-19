@@ -1,12 +1,15 @@
 // Module for interfacing with an MQTT broker
 #include "driver/gpio.h"
 #include "driver/timer.h"
+#include "esp_ipc.h"
 #include "esp_log.h"
 #include "lauxlib.h"
 #include "lmem.h"
 #include "lnodeaux.h"
 #include "module.h"
 #include "platform.h"
+#include "rom/gpio.h"
+#include "soc/soc.h"
 #include "task/task.h"
 
 #include <string.h>
@@ -19,6 +22,10 @@ typedef struct {
     int level;
     bool switched;
 } dim_t;
+
+typedef struct {
+    esp_err_t err;
+} config_interrupt_t;
 
 #define TIMER_RESOLUTION 10  // us;
 #define MAINS_FREQUENCY 50   // Hz
@@ -60,13 +67,16 @@ static void IRAM_ATTR timer_isr(void* arg) {
     for (int i = 0; i < dimCount; i++) {
         int level = dims[i].level;
         if ((dims[i].switched == false) && (elapsed > level)) {
-            gpio_set_level(dims[i].pin, 1 - dims[i].mode);
+            GPIO_OUTPUT_SET(dims[i].pin, (1 - dims[i].mode));
             dims[i].switched = true;
         }
     }
 
-    timerGroupDev->int_clr_timers.t0 = 1;                   //TODO: clear the right timer...
-    timerGroupDev->hw_timer[timerNum].config.alarm_en = 1;  //TODO: timerNum is now 0..3
+    if (timerNum == 0)
+        timerGroupDev->int_clr_timers.t0 = 1;
+    else
+        timerGroupDev->int_clr_timers.t1 = 1;
+    timerGroupDev->hw_timer[timerNum].config.alarm_en = 1;
 }
 static int zCount = 0;
 static void IRAM_ATTR zc_isr(void* arg) {
@@ -76,10 +86,10 @@ static void IRAM_ATTR zc_isr(void* arg) {
     if (elapsed > (1000 * 1000 / MAINS_FREQUENCY / 4)) {  // debounce the zc pin
         for (int i = 0; i < dimCount; i++) {
             if (dims[i].level == 0) {
-                gpio_set_level(dims[i].pin, 1 - dims[i].mode);
+                GPIO_OUTPUT_SET(dims[i].pin, (1 - dims[i].mode));
                 dims[i].switched = true;
             } else {
-                gpio_set_level(dims[i].pin, dims[i].mode);
+                GPIO_OUTPUT_SET(dims[i].pin, dims[i].mode);
                 dims[i].switched = false;
             }
         }
@@ -88,20 +98,69 @@ static void IRAM_ATTR zc_isr(void* arg) {
     }
 }
 
-static void enable_interrupts(lua_State* L) {
-    if (timerGroup != -1)
-        check_err(L, timer_enable_intr(timerGroup, timerNum));
-
-    if (zcPin != -1)
-        check_err(L, gpio_intr_enable(zcPin));
+static esp_err_t enable_interrupts() {
+    if (timerGroup != -1) {
+        int err = timer_enable_intr(timerGroup, timerNum);
+        if (err != ESP_OK) {
+            return err;
+        }
+        return gpio_intr_enable(zcPin);
+    }
+    return ESP_OK;
 }
 
-static void disable_interrupts(lua_State* L) {
-    if (timerGroup != -1)
-        check_err(L, timer_disable_intr(timerGroup, timerNum));
+static esp_err_t disable_interrupts() {
+    if (timerGroup != -1) {
+        int err = timer_disable_intr(timerGroup, timerNum);
+        if (err != ESP_OK) {
+            return err;
+        }
+        return gpio_intr_disable(zcPin);
+    }
+    return ESP_OK;
+}
 
-    if (zcPin != -1)
-        check_err(L, gpio_intr_disable(zcPin));
+static void configure_interrupts(void* arg) {
+    esp_err_t* err = (esp_err_t*)arg;
+
+    timer_config_t config = {
+        .alarm_en = true,
+        .counter_en = false,
+        .intr_type = TIMER_INTR_LEVEL,
+        .counter_dir = TIMER_COUNT_UP,
+        .auto_reload = true,
+        .divider = TIMER_DIVIDER};
+
+    if ((*err = timer_init(timerGroup, timerNum, &config)) != ESP_OK)
+        return;
+
+    if ((*err = timer_set_counter_value(timerGroup, timerNum, 0)) != ESP_OK)
+        return;
+
+    printf("timer_set_counter_value\n");
+
+    if ((*err = timer_set_alarm_value(timerGroup, timerNum, 1)) != ESP_OK)
+        return;
+
+    printf("timer_set_alarm_value\n");
+    if ((*err = timer_isr_register(timerGroup, timerNum, &timer_isr, NULL, ESP_INTR_FLAG_IRAM, &s_timer_handle)) != ESP_OK)
+        return;
+    printf("timer_isr_register\n");
+
+    if ((*err = gpio_set_direction(zcPin, GPIO_MODE_INPUT)) != ESP_OK)
+        return;
+
+    printf("gpio_set_direction\n");
+
+    if ((*err = gpio_set_pull_mode(zcPin, GPIO_PULLUP_ONLY)) != ESP_OK)
+        return;
+    printf("gpio_set_pull_mode\n");
+
+    if ((*err = gpio_set_intr_type(zcPin, GPIO_INTR_POSEDGE)) != ESP_OK) return;
+    printf("gpio_set_intr_type\n");
+
+    if ((*err = gpio_isr_handler_add(zcPin, zc_isr, NULL)) != ESP_OK) return;
+    printf("gpio_isr_handler_add\n");
 }
 
 // pin
@@ -196,47 +255,32 @@ static int dimmer_setup(lua_State* L) {
     zcPin = luaL_checkinteger(L, -1);
     lua_getfield(L, 1, "timer");
     int timer = luaL_optint(L, -1, DIM_TIMER0);
-    timerGroup = timer & 0x1;
-    timerNum = (timer & 0x10) >> 1;
+    ESP_LOGD(TAG, "timer=%d", timer);
+
+    lua_getfield(L, 1, "core");
+    int core = luaL_optint(L, -1, 0);
+
+    timerNum = timer & 0x1;
+    timerGroup = (timer & 0x2) >> 1;
 
     if (timerGroup == 0) {
         timerGroupDev = &TIMERG0;
     } else {
         timerGroupDev = &TIMERG1;
     }
-    ESP_LOGD(TAG, "Dimmer setup. TG=%d, TN=%d, ZC=%d", timerGroup, timerNum, zcPin);
 
-    disable_interrupts(L);
+    esp_err_t err;
 
-    timer_config_t config = {
-        .alarm_en = true,
-        .counter_en = false,
-        .intr_type = TIMER_INTR_LEVEL,
-        .counter_dir = TIMER_COUNT_UP,
-        .auto_reload = true,
-        .divider = TIMER_DIVIDER};
+    check_err(L, disable_interrupts());
+    check_err(L, esp_ipc_call_blocking(core, configure_interrupts, (void*)&err));
+    check_err(L, enable_interrupts());
+    check_err(L, err);
 
-    timer_init(timerGroup, timerNum, &config);
-
-    timer_set_counter_value(timerGroup, timerNum, 0);
-    printf("timer_set_counter_value\n");
-
-    timer_set_alarm_value(timerGroup, timerNum, 1);
-    printf("timer_set_alarm_value\n");
-    timer_isr_register(timerGroup, timerNum, &timer_isr, NULL, 0, &s_timer_handle);
-    printf("timer_isr_register\n");
-
-    timer_start(timerGroup, timerNum);
+    check_err(L, timer_start(timerGroup, timerNum));
     printf("timer_start\n");
 
-    check_err(L, gpio_set_direction(zcPin, GPIO_MODE_INPUT));
-    check_err(L, gpio_set_pull_mode(zcPin, GPIO_PULLUP_ONLY));
-    //   check_err(L, gpio_install_isr_service(ESP_INTR_FLAG_HIGH));
-    check_err(L, gpio_set_intr_type(zcPin, GPIO_INTR_POSEDGE));
-    check_err(L, gpio_isr_handler_add(zcPin, zc_isr, NULL));
+    ESP_LOGD(TAG, "Dimmer setup. TG=%d, TN=%d, ZC=%d", timerGroup, timerNum, zcPin);
 
-    ESP_LOGD(TAG, "zc interrupt set");
-    enable_interrupts(L);
     return 0;
 }
 
