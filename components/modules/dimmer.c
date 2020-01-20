@@ -1,18 +1,20 @@
 // Module for interfacing with an MQTT broker
+#include <string.h>
 #include "driver/gpio.h"
 #include "driver/timer.h"
+#include "esp_clk.h"
 #include "esp_ipc.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lauxlib.h"
 #include "lmem.h"
 #include "lnodeaux.h"
 #include "module.h"
 #include "platform.h"
 #include "rom/gpio.h"
-#include "soc/soc.h"
-#include "task/task.h"
-
-#include <string.h>
+#include "soc/cpu.h"
+#include "soc/rtc_wdt.h"
 
 #define TAG "DIMMER"
 
@@ -39,16 +41,11 @@ typedef struct {
 #define DIM_MODE_LEADING_EDGE 0x0
 #define DIM_MODE_TRAILING_EDGE 0x1
 
-static intr_handle_t s_timer_handle;
-static int timerGroup = -1;
-static int timerNum = -1;
 static int zcPin = -1;
 static int64_t zcTimestamp = 0;
 static int64_t p = 0;
 static dim_t* dims = NULL;
 static int dimCount = 0;
-
-static timg_dev_t* timerGroupDev;
 
 static int check_err(lua_State* L, esp_err_t err) {
     switch (err) {
@@ -62,8 +59,39 @@ static int check_err(lua_State* L, esp_err_t err) {
     return 0;
 }
 
-static void IRAM_ATTR timer_isr(void* arg) {
-    int64_t elapsed = esp_timer_get_time() - zcTimestamp;
+// menuconfig changes required in components/ESP32-specific...
+// removed: "Also watch CPU1 tick interrupt"
+// removed: "Watch CPU1 idle task"
+
+int clock_freq;
+uint32_t cycle_count = 0;
+uint32_t last_cycle_count = 0;
+uint64_t total_cycles = 0;
+volatile bool disable_loop = false;
+volatile bool disable_loop_ack = false;
+
+static int64_t IRAM_ATTR micros() {
+    RSR(CCOUNT, cycle_count);
+    if (cycle_count < last_cycle_count) {
+        total_cycles += cycle_count + 0xFFFFFFFF - last_cycle_count;
+    } else {
+        total_cycles += cycle_count - last_cycle_count;
+    }
+    last_cycle_count = cycle_count;
+    return (int64_t)(((int64_t)total_cycles) * 1000000 / clock_freq);
+}
+
+void IRAM_ATTR delayMicroseconds(uint32_t us) {
+    if (us) {
+        int64_t m = micros();
+        while ((micros() - m) < us) {
+            asm(" nop");
+        }
+    }
+}
+
+static void IRAM_ATTR timer_isr(int64_t now) {
+    int64_t elapsed = now - zcTimestamp;
     for (int i = 0; i < dimCount; i++) {
         int level = dims[i].level;
         if ((dims[i].switched == false) && (elapsed > level)) {
@@ -71,17 +99,10 @@ static void IRAM_ATTR timer_isr(void* arg) {
             dims[i].switched = true;
         }
     }
-
-    if (timerNum == 0)
-        timerGroupDev->int_clr_timers.t0 = 1;
-    else
-        timerGroupDev->int_clr_timers.t1 = 1;
-    timerGroupDev->hw_timer[timerNum].config.alarm_en = 1;
 }
 static int zCount = 0;
-static void IRAM_ATTR zc_isr(void* arg) {
+static void IRAM_ATTR zc_isr(int64_t now) {
     zCount++;
-    int64_t now = esp_timer_get_time();
     int64_t elapsed = now - zcTimestamp;
     if (elapsed > (1000 * 1000 / MAINS_FREQUENCY / 4)) {  // debounce the zc pin
         for (int i = 0; i < dimCount; i++) {
@@ -98,69 +119,15 @@ static void IRAM_ATTR zc_isr(void* arg) {
     }
 }
 
-static esp_err_t enable_interrupts() {
-    if (timerGroup != -1) {
-        int err = timer_enable_intr(timerGroup, timerNum);
-        if (err != ESP_OK) {
-            return err;
-        }
-        return gpio_intr_enable(zcPin);
-    }
-    return ESP_OK;
+static void enable_interrupts() {
+    disable_loop = false;
+    disable_loop_ack = false;
 }
 
-static esp_err_t disable_interrupts() {
-    if (timerGroup != -1) {
-        int err = timer_disable_intr(timerGroup, timerNum);
-        if (err != ESP_OK) {
-            return err;
-        }
-        return gpio_intr_disable(zcPin);
-    }
-    return ESP_OK;
-}
-
-static void configure_interrupts(void* arg) {
-    esp_err_t* err = (esp_err_t*)arg;
-
-    timer_config_t config = {
-        .alarm_en = true,
-        .counter_en = false,
-        .intr_type = TIMER_INTR_LEVEL,
-        .counter_dir = TIMER_COUNT_UP,
-        .auto_reload = true,
-        .divider = TIMER_DIVIDER};
-
-    if ((*err = timer_init(timerGroup, timerNum, &config)) != ESP_OK)
-        return;
-
-    if ((*err = timer_set_counter_value(timerGroup, timerNum, 0)) != ESP_OK)
-        return;
-
-    printf("timer_set_counter_value\n");
-
-    if ((*err = timer_set_alarm_value(timerGroup, timerNum, 1)) != ESP_OK)
-        return;
-
-    printf("timer_set_alarm_value\n");
-    if ((*err = timer_isr_register(timerGroup, timerNum, &timer_isr, NULL, ESP_INTR_FLAG_IRAM, &s_timer_handle)) != ESP_OK)
-        return;
-    printf("timer_isr_register\n");
-
-    if ((*err = gpio_set_direction(zcPin, GPIO_MODE_INPUT)) != ESP_OK)
-        return;
-
-    printf("gpio_set_direction\n");
-
-    if ((*err = gpio_set_pull_mode(zcPin, GPIO_PULLUP_ONLY)) != ESP_OK)
-        return;
-    printf("gpio_set_pull_mode\n");
-
-    if ((*err = gpio_set_intr_type(zcPin, GPIO_INTR_POSEDGE)) != ESP_OK) return;
-    printf("gpio_set_intr_type\n");
-
-    if ((*err = gpio_isr_handler_add(zcPin, zc_isr, NULL)) != ESP_OK) return;
-    printf("gpio_isr_handler_add\n");
+static void disable_interrupts() {
+    disable_loop = true;
+    while (!disable_loop_ack)
+        ;
 }
 
 // pin
@@ -173,7 +140,7 @@ static int dimmer_add(lua_State* L) {
         }
     }
     check_err(L, gpio_set_direction(pin, GPIO_MODE_OUTPUT));
-    disable_interrupts(L);
+    disable_interrupts();
     dims = luaM_realloc_(L, dims, dimCount * sizeof(dim_t), (dimCount + 1) * sizeof(dim_t));
     dims[dimCount].pin = pin;
     dims[dimCount].level = (mode == DIM_MODE_LEADING_EDGE) ? p * 2 : 0;
@@ -181,13 +148,13 @@ static int dimmer_add(lua_State* L) {
     dims[dimCount].switched = false;
     dimCount++;
     gpio_set_level(pin, 0);
-    enable_interrupts(L);
+    enable_interrupts();
     return 0;
 }
 
 static int dimmer_remove(lua_State* L) {
     int pin = luaL_checkint(L, 1);
-    disable_interrupts(L);
+    disable_interrupts();
     for (int i = 0; i < dimCount; i++) {
         if (dims[i].pin == pin) {
             for (int j = i; j < dimCount - 1; j++) {
@@ -195,23 +162,23 @@ static int dimmer_remove(lua_State* L) {
             }
             dims = luaM_realloc_(L, dims, dimCount * sizeof(dim_t), (dimCount - 1) * sizeof(dim_t));
             dimCount--;
-            enable_interrupts(L);
+            enable_interrupts();
             return 0;
         }
     }
-    enable_interrupts(L);
+    enable_interrupts();
     luaL_error(L, "Error: pin %d is not dimmed.", pin);
     return 0;
 }
 
 static int dimmer_list_debug(lua_State* L) {
-    disable_interrupts(L);
+    disable_interrupts();
     printf("This is v2\n");
     ESP_LOGD(TAG, "p=%lld, zcount=%d, zcTimestamp=%lld", p, zCount, zcTimestamp);
     for (int i = 0; i < dimCount; i++) {
         ESP_LOGD(TAG, "pin=%d, mode=%d, level=%d", dims[i].pin, dims[i].mode, dims[i].level);
     }
-    enable_interrupts(L);
+    enable_interrupts();
     return 0;
 }
 
@@ -248,6 +215,47 @@ static int dimmer_mainsFrequency(lua_State* L) {
     return 1;
 }
 
+static void IRAM_ATTR stuff(void* parms) {
+    portDISABLE_INTERRUPTS();
+    rtc_wdt_protect_off();
+    rtc_wdt_disable();
+    clock_freq = esp_clk_cpu_freq();
+
+    /*
+    int level = 0;
+    gpio_set_direction(16, GPIO_MODE_OUTPUT);
+    while (1) {
+        GPIO_OUTPUT_SET(16, level);
+        if (level == 0) {
+            level = 1;
+        } else {
+            level = 0;
+        }
+        delayMicroseconds(1000000);
+    }
+    */
+    int zcPinOldState = 0, zcPinState = 0;
+
+    while (true) {
+        if (disable_loop) {
+            disable_loop_ack = true;
+            while (!disable_loop)
+                ;
+        }
+        int64_t now = micros();
+        zcPinState = GPIO_INPUT_GET(zcPin);
+        if (zcPinOldState == 0 && zcPinState == 1) {
+            zc_isr(now);
+        }
+        zcPinOldState = zcPinState;
+        timer_isr(now);
+    }
+}
+
+#define STACK_SIZE 4096
+StackType_t xStack[STACK_SIZE];
+StaticTask_t xTaskBuffer;
+
 // hw timer group, hw_timer num, zc pin
 static int dimmer_setup(lua_State* L) {
     luaL_checkanytable(L, 1);
@@ -257,29 +265,21 @@ static int dimmer_setup(lua_State* L) {
     int timer = luaL_optint(L, -1, DIM_TIMER0);
     ESP_LOGD(TAG, "timer=%d", timer);
 
-    lua_getfield(L, 1, "core");
-    int core = luaL_optint(L, -1, 0);
+    check_err(L, gpio_set_direction(zcPin, GPIO_MODE_INPUT));
+    check_err(L, gpio_set_pull_mode(zcPin, GPIO_PULLUP_ONLY));
 
-    timerNum = timer & 0x1;
-    timerGroup = (timer & 0x2) >> 1;
-
-    if (timerGroup == 0) {
-        timerGroupDev = &TIMERG0;
-    } else {
-        timerGroupDev = &TIMERG1;
-    }
-
-    esp_err_t err;
-
-    check_err(L, disable_interrupts());
-    check_err(L, esp_ipc_call_blocking(core, configure_interrupts, (void*)&err));
-    check_err(L, enable_interrupts());
-    check_err(L, err);
-
-    check_err(L, timer_start(timerGroup, timerNum));
-    printf("timer_start\n");
-
-    ESP_LOGD(TAG, "Dimmer setup. TG=%d, TN=%d, ZC=%d", timerGroup, timerNum, zcPin);
+    ESP_LOGD(TAG, "Dimmer setup. ZC=%d", zcPin);
+    TaskHandle_t handle;
+    xTaskCreatePinnedToCore(
+        stuff,       // Function that implements the task.
+        "stuff",     // Text name for the task.
+        STACK_SIZE,  // Stack size in bytes, not words.
+        (void*)1,    // Parameter passed into the task.
+        tskIDLE_PRIORITY + 20,
+        &handle,
+        //        xStack,        // Array to use as the task's stack.
+        //        &xTaskBuffer,  // Variable to hold the task's data structure.
+        1);
 
     return 0;
 }
