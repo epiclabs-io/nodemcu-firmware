@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/xtensa_timer.h"
 #include "lauxlib.h"
 #include "lmem.h"
 #include "lnodeaux.h"
@@ -215,8 +216,30 @@ static int dimmer_mainsFrequency(lua_State* L) {
     return 1;
 }
 
-static void IRAM_ATTR stuff(void* parms) {
+static void IRAM_ATTR disable_timer() {
+    /*
+    Enable the timer interrupt at the device level. Don't write directly
+    to the INTENABLE register because it may be virtualized.
+    */
+    /*
+#ifdef __XTENSA_CALL0_ABI__
+    asm volatile(
+        "movi    a2, XT_TIMER_INTEN\n")
+        "call0   xt_ints_off")
+#else
+    asm volatile(
+        "movi a6, XT_TIMER_INTEN\n"
+        "call4 xt_ints_off")
+#endif
+*/
     portDISABLE_INTERRUPTS();
+    ESP_INTR_DISABLE(XT_TIMER_INTNUM);
+    portENABLE_INTERRUPTS();
+}
+
+static void IRAM_ATTR stuff(void* parms) {
+    //Find a way to disable the cpu1 tick interrupt.
+    disable_timer();
     rtc_wdt_protect_off();
     rtc_wdt_disable();
     clock_freq = esp_clk_cpu_freq();
@@ -253,7 +276,7 @@ static void IRAM_ATTR stuff(void* parms) {
 }
 
 #define STACK_SIZE 4096
-StackType_t xStack[STACK_SIZE];
+
 StaticTask_t xTaskBuffer;
 
 // hw timer group, hw_timer num, zc pin
